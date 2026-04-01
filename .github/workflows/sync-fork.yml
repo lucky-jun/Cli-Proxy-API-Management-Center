@@ -1,0 +1,94 @@
+name: 自动同步上游仓库（含 Releases 和附件）
+
+on:
+  workflow_dispatch:        # 手动触发
+  schedule:
+    - cron: '0 0 * * *'    # 每天 UTC 0:00 自动运行（可选）
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 获取仓库信息
+        id: repo_info
+        run: |
+          REPO_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }})
+          IS_FORK=$(echo "$REPO_INFO" | jq -r '.fork')
+          if [ "$IS_FORK" != "true" ]; then
+            echo "❌ 当前仓库不是 Fork 仓库"
+            exit 1
+          fi
+          UPSTREAM=$(echo "$REPO_INFO" | jq -r '.parent.full_name')
+          DEFAULT_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
+          echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GIT_TOKEN }}
+          fetch-depth: 0
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 添加上游仓库并同步代码和 Tags
+        run: |
+          git remote add upstream https://github.com/${{ steps.repo_info.outputs.upstream }}
+          git fetch upstream --tags
+          git checkout ${{ steps.repo_info.outputs.default_branch }}
+          git merge upstream/${{ steps.repo_info.outputs.default_branch }} --allow-unrelated-histories || true
+          git push origin ${{ steps.repo_info.outputs.default_branch }}
+          git push origin --tags
+
+      - name: 同步 Releases 和附件
+        env:
+          GH_TOKEN: ${{ secrets.MY_GIT_TOKEN }}
+        run: |
+          UPSTREAM_REPO="${{ steps.repo_info.outputs.upstream }}"
+          TARGET_REPO="${{ github.repository }}"
+          
+          # 获取上游所有 Releases
+          RELEASES=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/releases" | jq -r '.[] | @base64')
+          
+          for release_base64 in $RELEASES; do
+            release=$(echo "$release_base64" | base64 --decode)
+            tag=$(echo "$release" | jq -r '.tag_name')
+            name=$(echo "$release" | jq -r '.name')
+            body=$(echo "$release" | jq -r '.body')
+            prerelease=$(echo "$release" | jq -r '.prerelease')
+            
+            # 检查目标仓库是否已有此 Release
+            existing=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$TARGET_REPO/releases/tags/$tag" | jq -r '.id')
+            
+            if [ "$existing" = "null" ]; then
+              echo "创建 Release: $tag"
+              # 创建 Release
+              create_response=$(curl -s -X POST -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$TARGET_REPO/releases" \
+                -d "{\"tag_name\":\"$tag\",\"name\":\"$name\",\"body\":$body,\"prerelease\":$prerelease}")
+              
+              release_id=$(echo "$create_response" | jq -r '.id')
+              
+              # 同步附件
+              assets_url=$(echo "$release" | jq -r '.assets_url')
+              assets=$(curl -s -H "Authorization: token $GH_TOKEN" "$assets_url" | jq -r '.[] | .browser_download_url')
+              for asset_url in $assets; do
+                filename=$(basename "$asset_url")
+                curl -L -o "$filename" "$asset_url"
+                curl -X POST -H "Authorization: token $GH_TOKEN" \
+                  -H "Content-Type: $(file -b --mime-type "$filename")" \
+                  "https://uploads.github.com/repos/$TARGET_REPO/releases/$release_id/assets?name=$filename" \
+                  --data-binary @"$filename"
+              done
+            else
+              echo "Release $tag 已存在，跳过"
+            fi
+          done
